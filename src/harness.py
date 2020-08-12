@@ -18,37 +18,67 @@ from urllib3.connection import HTTPConnection
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Transfer a stream of CCD images."
-    )
-    parser.add_argument('-d', '--destination', metavar='URL', required=True,
+        description="Transfer a stream of CCD images.")
+    parser.add_argument('-d',
+                        '--destination',
+                        metavar='URL',
+                        required=True,
                         help=("URL with"
                               " gsapi, boto, minio, https, http, bbcp, scp"
                               " scheme"))
-    parser.add_argument('-s', '--starttime', metavar='HH:MM', required=True,
+    parser.add_argument('-s',
+                        '--starttime',
+                        metavar='HH:MM',
+                        required=True,
                         help="local time to start simulation")
-    parser.add_argument('-n', '--numexp', metavar='EXPOSURES', type=int,
-                        required=True, help="number of exposures to simulate")
-    parser.add_argument('-c', '--ccds', metavar='CCDS', type=int,
-                        default=1, help="number of CCDs to simulate")
-    parser.add_argument('-i', '--interval', type=int, default=17,
+    parser.add_argument('-n',
+                        '--numexp',
+                        metavar='EXPOSURES',
+                        type=int,
+                        required=True,
+                        help="number of exposures to simulate")
+    parser.add_argument('-c',
+                        '--ccds',
+                        metavar='CCDS',
+                        type=int,
+                        default=1,
+                        help="number of CCDs to simulate")
+    parser.add_argument('-i',
+                        '--interval',
+                        type=int,
+                        default=17,
                         help="interval between exposures in sec")
-    parser.add_argument('-I', '--inputfile', type=Path,
-                        default="./data/S00.fits", help="input directory")
-    parser.add_argument('-t', '--tempdir', type=Path, default="/tmp",
+    parser.add_argument('-I',
+                        '--inputfile',
+                        type=Path,
+                        default="./data/S00.fits",
+                        help="input directory")
+    parser.add_argument('-t',
+                        '--tempdir',
+                        type=Path,
+                        default="/tmp",
                         help="temporary directory")
-    parser.add_argument('-z', '--compress', action='store_true',
+    parser.add_argument('-z',
+                        '--compress',
+                        action='store_true',
                         help="compress before transfer")
-    parser.add_argument('-P', '--private', action='store_true',
+    parser.add_argument('-P',
+                        '--private',
+                        action='store_true',
                         help="use private Google Cloud interconnect")
-    parser.add_argument('-K', '--keepalive', action='store_true',
+    parser.add_argument('-K',
+                        '--keepalive',
+                        action='store_true',
                         help="use TCP keepalive options")
     return parser
 
 
 class Waiter:
     def __init__(self, hour: int, minute: int, interval: int):
-        self.base_time = datetime.now().replace(hour=hour, minute=minute,
-                                                second=0, microsecond=0)
+        self.base_time = datetime.now().replace(hour=hour,
+                                                minute=minute,
+                                                second=0,
+                                                microsecond=0)
         self.interval = interval
 
     def wait_exposure(self, num: int):
@@ -63,7 +93,6 @@ class Waiter:
 
 
 def log_timing(func):
-
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         logging.info(f"Start {func.__name__}")
@@ -122,7 +151,10 @@ class GsapiUploader(Uploader):
             self.prefix = ""
         logging.info(f"gsapi: opening bucket {bucket}"
                      f", saving prefix '{self.prefix}'")
-        self.bucket = storage.Client().bucket(bucket)
+        self.client = storage.Client()
+        self.session = self.client._http
+        self.bucket_name = bucket
+        self.bucket = self.client.bucket(self.bucket_name)
         try:
             _ = self.bucket.blob(".null").download_as_string()
         except Exception as exc:
@@ -131,12 +163,20 @@ class GsapiUploader(Uploader):
     @log_timing
     def transfer(self, temp_dir: Path, source: Path):
         logging.info(f"gsapi: uploading to {self.prefix}/{source}")
-        size = 100*1024*1024
-        if self.prefix == "":
-            blob = self.bucket.blob(f"{source}", chunk_size=size)
-        else:
-            blob = self.bucket.blob(f"{self.prefix}/{source}", chunk_size=size)
-        blob.upload_from_filename(temp_dir / source)
+        fz_path = temp_dir / source
+        fz_size = os.path.getsize(fz_path)
+        with open(fz_path, "rb", fz_size) as payload:
+            blob_path = f"{self.prefix}/{source}" if self.prefix else f"{source}"
+            headers = {
+                "Content-Length": str(fz_size),
+                "Transfer-Encoding": "identity"
+            }
+            self.session.post(
+                f"https://storage.googleapis.com/upload/storage/v1/"
+                "b/{self.bucket_name}/"
+                "o?uploadType=media&name={blob_path}",
+                headers=headers,
+                data=payload)
 
 
 class BotoUploader(Uploader):
@@ -146,14 +186,16 @@ class BotoUploader(Uploader):
         logging.info(f"boto: opening host {host}, saving bucket {self.bucket}"
                      f", prefix '{self.prefix}'")
         self.client = boto3.client('s3')
-        self.client.put_object(Bucket=self.bucket, Key=".null",
-                               Body=b"", ContentLength=0)
+        self.client.put_object(Bucket=self.bucket,
+                               Key=".null",
+                               Body=b"",
+                               ContentLength=0)
 
     @log_timing
     def transfer(self, temp_dir: Path, source: Path):
         logging.info(f"boto: uploading to {self.prefix}/{source}")
-        self.client.upload_file(temp_dir / source,
-                              self.bucket, f"{self.prefix}/{source}")
+        self.client.upload_file(temp_dir / source, self.bucket,
+                                f"{self.prefix}/{source}")
 
 
 class MinioUploader(Uploader):
@@ -168,11 +210,8 @@ class MinioUploader(Uploader):
     @log_timing
     def transfer(self, temp_dir: Path, source: Path):
         logging.info(f"minio: uploading to {self.prefix}/{source}")
-        self.conn.fput_object(
-            self.bucket,
-            f"{self.prefix}/{source}",
-            temp_dir / source
-        )
+        self.conn.fput_object(self.bucket, f"{self.prefix}/{source}",
+                              temp_dir / source)
 
 
 class HttpUploader(Uploader):
@@ -199,8 +238,10 @@ class BbcpUploader(Uploader):
     @log_timing
     def transfer(self, temp_dir: Path, source: Path):
         logging.info(f"bbcp: dir {self.path / source.parent}; file {source}")
-        subprocess.run(["bbcp", "-A", self.path / source,
-                        f"{self.host}:{self.path / source}"])
+        subprocess.run([
+            "bbcp", "-A", self.path / source,
+            f"{self.host}:{self.path / source}"
+        ])
 
 
 class ScpUploader(Uploader):
@@ -213,9 +254,10 @@ class ScpUploader(Uploader):
     def transfer(self, temp_dir: Path, source: Path):
         logging.info(f"scp: dir {self.path / source.parent}; file {source}")
         with (temp_dir / source).open("rb") as s:
-            subprocess.run(["ssh", self.host,
-                            f"mkdir -p {self.path / source.parent};"
-                            f"cat > {self.path / source}"],
+            subprocess.run([
+                "ssh", self.host, f"mkdir -p {self.path / source.parent};"
+                f"cat > {self.path / source}"
+            ],
                            stdin=s)
 
 
@@ -229,11 +271,9 @@ def simulate(
     inputfile: str,
     compress: bool,
 ) -> None:
-    logging.basicConfig(
-        format=f"{ccd_name}" + " {asctime} {message}",
-        style="{",
-        level="INFO"
-    )
+    logging.basicConfig(format=f"{ccd_name}" + " {asctime} {message}",
+                        style="{",
+                        level="INFO")
 
     print(f"Socket opts = {HTTPConnection.default_socket_options}")
 
@@ -258,8 +298,7 @@ def simulate(
 
             dest_path = Path(obs_day_str).joinpath(
                 f"{obs_day}{seqnum:05d}",
-                f"MC_O_{obs_day}_{seqnum:05d}_{ccd_name}.fits"
-            )
+                f"MC_O_{obs_day}_{seqnum:05d}_{ccd_name}.fits")
             logging.info(f"Copying from {source_path} to"
                          f" {temp_path / dest_path}"
                          f" with compress = {compress}")
@@ -308,16 +347,9 @@ def main():
     for ccd in range(args.ccds):
         pid = os.fork()
         if pid == 0:
-            simulate(
-                f"{node_num}-{ccd}",
-                args.starttime,
-                args.destination,
-                args.interval,
-                args.tempdir,
-                args.numexp,
-                args.inputfile,
-                args.compress
-            )
+            simulate(f"{node_num}-{ccd}", args.starttime, args.destination,
+                     args.interval, args.tempdir, args.numexp, args.inputfile,
+                     args.compress)
             logging.info("Child process exiting")
             exit(0)
         else:
